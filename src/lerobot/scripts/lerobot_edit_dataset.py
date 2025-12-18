@@ -165,7 +165,13 @@ def get_output_path(repo_id: str, new_repo_id: str | None, root: Path | None) ->
         output_dir = root / new_repo_id if root else HF_LEROBOT_HOME / new_repo_id
     else:
         output_repo_id = repo_id
-        dataset_path = root / repo_id if root else HF_LEROBOT_HOME / repo_id
+        # Check if root already contains repo_id (ends with repo_id)
+        if root and root.name == repo_id:
+            # root already points to the dataset directory
+            dataset_path = root
+        else:
+            # root is parent directory, need to append repo_id
+            dataset_path = root / repo_id if root else HF_LEROBOT_HOME / repo_id
         old_path = Path(str(dataset_path) + "_old")
 
         if dataset_path.exists():
@@ -186,12 +192,27 @@ def handle_delete_episodes(cfg: EditDatasetConfig) -> None:
         raise ValueError("episode_indices must be specified for delete_episodes operation")
 
     dataset = LeRobotDataset(cfg.repo_id, root=cfg.root)
+    
+    # Determine the root directory for get_output_path
+    # If cfg.root already ends with repo_id, use its parent; otherwise use cfg.root as-is
+    if cfg.root:
+        root_path = Path(cfg.root)
+        if root_path.name == cfg.repo_id:
+            # cfg.root already points to dataset directory, use parent as root
+            path_for_get_output = root_path.parent
+        else:
+            # cfg.root is parent directory
+            path_for_get_output = root_path
+    else:
+        path_for_get_output = None
+    
     output_repo_id, output_dir = get_output_path(
-        cfg.repo_id, cfg.new_repo_id, Path(cfg.root) if cfg.root else None
+        cfg.repo_id, cfg.new_repo_id, path_for_get_output
     )
 
     if cfg.new_repo_id is None:
-        dataset.root = Path(str(dataset.root) + "_old")
+        # After get_output_path moves the dataset, update dataset.root to point to _old directory
+        dataset.root = Path(str(output_dir) + "_old")
 
     logging.info(f"Deleting episodes {cfg.operation.episode_indices} from {cfg.repo_id}")
     new_dataset = delete_episodes(

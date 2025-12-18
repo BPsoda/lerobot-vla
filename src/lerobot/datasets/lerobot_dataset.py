@@ -678,7 +678,13 @@ class LeRobotDataset(torch.utils.data.Dataset):
         """
         super().__init__()
         self.repo_id = repo_id
-        self.root = Path(root) if root else HF_LEROBOT_HOME / repo_id
+        if root:
+            if Path(root).name == repo_id:
+                self.root = Path(root)
+            else:
+                self.root = Path(root) / repo_id
+        else:
+            self.root = HF_LEROBOT_HOME / repo_id
         self.image_transforms = image_transforms
         self.delta_timestamps = delta_timestamps
         self.episodes = episodes
@@ -1149,6 +1155,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         self,
         episode_data: dict | None = None,
         parallel_encoding: bool = True,
+        stats_max_workers: int | None = None,
     ) -> None:
         """
         This will save to disk the current episode in self.episode_buffer.
@@ -1192,7 +1199,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
 
         # Wait for image writer to end, so that episode stats over images can be computed
         self._wait_image_writer()
-        ep_stats = compute_episode_stats(episode_buffer, self.features)
+        ep_stats = compute_episode_stats(episode_buffer, self.features, max_workers=stats_max_workers)
 
         ep_metadata = self._save_episode_data(episode_buffer)
         has_video_keys = len(self.meta.video_keys) > 0

@@ -14,6 +14,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import numpy as np
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import partial
 
 from lerobot.datasets.utils import load_image_as_numpy
 
@@ -227,21 +229,67 @@ def auto_downsample_height_width(img: np.ndarray, target_size: int = 150, max_si
     return img[:, ::downsample_factor, ::downsample_factor]
 
 
-def sample_images(image_paths: list[str]) -> np.ndarray:
+def _load_and_downsample_image(path: str, target_size: int = 150, max_size_threshold: int = 300) -> np.ndarray:
+    """Load and downsample a single image. Used for parallel processing."""
+    img = load_image_as_numpy(path, dtype=np.uint8, channel_first=True)
+    img = auto_downsample_height_width(img, target_size=target_size, max_size_threshold=max_size_threshold)
+    return img
+
+
+def sample_images(image_paths: list[str], max_workers: int | None = None) -> np.ndarray:
+    """Sample and load images from paths, with optional parallel loading.
+    
+    Args:
+        image_paths: List of image file paths
+        max_workers: Maximum number of parallel workers for image loading. 
+                    If None, uses min(32, len(sampled_indices) + 4). 
+                    If 1, uses sequential loading.
+    
+    Returns:
+        Array of sampled images with shape (num_samples, C, H, W)
+    """
     sampled_indices = sample_indices(len(image_paths))
-
-    images = None
-    for i, idx in enumerate(sampled_indices):
-        path = image_paths[idx]
-        # we load as uint8 to reduce memory usage
-        img = load_image_as_numpy(path, dtype=np.uint8, channel_first=True)
-        img = auto_downsample_height_width(img)
-
-        if images is None:
-            images = np.empty((len(sampled_indices), *img.shape), dtype=np.uint8)
-
-        images[i] = img
-
+    
+    if not sampled_indices:
+        raise ValueError("No images to sample")
+    
+    # Determine number of workers
+    if max_workers is None:
+        max_workers = min(32, len(sampled_indices) + 4)
+    
+    # Use sequential loading for small batches or when max_workers=1
+    if max_workers == 1 or len(sampled_indices) <= 4:
+        images = None
+        for i, idx in enumerate(sampled_indices):
+            path = image_paths[idx]
+            img = load_image_as_numpy(path, dtype=np.uint8, channel_first=True)
+            img = auto_downsample_height_width(img)
+            
+            if images is None:
+                images = np.empty((len(sampled_indices), *img.shape), dtype=np.uint8)
+            
+            images[i] = img
+        return images
+    
+    # Parallel loading for larger batches
+    sampled_paths = [image_paths[idx] for idx in sampled_indices]
+    
+    # Load images in parallel
+    images_list = [None] * len(sampled_indices)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Submit all tasks
+        future_to_idx = {
+            executor.submit(_load_and_downsample_image, path): i 
+            for i, path in enumerate(sampled_paths)
+        }
+        
+        # Collect results as they complete
+        for future in as_completed(future_to_idx):
+            idx = future_to_idx[future]
+            images_list[idx] = future.result()
+    
+    # Stack into array
+    images = np.stack(images_list, axis=0)
     return images
 
 
@@ -478,6 +526,7 @@ def compute_episode_stats(
     episode_data: dict[str, list[str] | np.ndarray],
     features: dict,
     quantile_list: list[float] | None = None,
+    max_workers: int | None = None,
 ) -> dict:
     """Compute comprehensive statistics for all features in an episode.
 
@@ -491,6 +540,10 @@ def compute_episode_stats(
             - For images/videos: list of file paths
             - For numerical data: numpy arrays
         features: Dictionary describing each feature's dtype and shape
+        quantile_list: List of quantiles to compute. Defaults to DEFAULT_QUANTILES.
+        max_workers: Maximum number of parallel workers for image loading.
+                    If None, uses min(32, num_image_features * 8). 
+                    If 1, uses sequential processing.
 
     Returns:
         Dictionary mapping feature names to their statistics dictionaries.
@@ -503,28 +556,52 @@ def compute_episode_stats(
     if quantile_list is None:
         quantile_list = DEFAULT_QUANTILES
 
-    ep_stats = {}
+    # Separate image/video features from numerical features
+    image_keys = []
+    numerical_keys = []
+    
     for key, data in episode_data.items():
         if features[key]["dtype"] == "string":
             continue
-
         if features[key]["dtype"] in ["image", "video"]:
-            ep_ft_array = sample_images(data)
-            axes_to_reduce = (0, 2, 3)
-            keepdims = True
+            image_keys.append(key)
         else:
-            ep_ft_array = data
-            axes_to_reduce = 0
-            keepdims = data.ndim == 1
-
+            numerical_keys.append(key)
+    
+    # Determine number of workers for image loading
+    if max_workers is None and image_keys:
+        max_workers = min(32, len(image_keys) * 8)
+    elif max_workers is None:
+        max_workers = 1
+    
+    ep_stats = {}
+    
+    # Process numerical features first (fast, no I/O)
+    for key in numerical_keys:
+        data = episode_data[key]
+        ep_ft_array = data
+        axes_to_reduce = 0
+        keepdims = data.ndim == 1
+        
         ep_stats[key] = get_feature_stats(
             ep_ft_array, axis=axes_to_reduce, keepdims=keepdims, quantile_list=quantile_list
         )
-
-        if features[key]["dtype"] in ["image", "video"]:
-            ep_stats[key] = {
-                k: v if k == "count" else np.squeeze(v / 255.0, axis=0) for k, v in ep_stats[key].items()
-            }
+    
+    # Process image/video features (I/O bound, can benefit from parallelization)
+    for key in image_keys:
+        data = episode_data[key]
+        ep_ft_array = sample_images(data, max_workers=max_workers)
+        axes_to_reduce = (0, 2, 3)
+        keepdims = True
+        
+        ep_stats[key] = get_feature_stats(
+            ep_ft_array, axis=axes_to_reduce, keepdims=keepdims, quantile_list=quantile_list
+        )
+        
+        # Normalize image stats to [0,1]
+        ep_stats[key] = {
+            k: v if k == "count" else np.squeeze(v / 255.0, axis=0) for k, v in ep_stats[key].items()
+        }
 
     return ep_stats
 
