@@ -1,0 +1,13 @@
+python -m lerobot.scripts.lbm_dataset_convert_parallel \
+    --lbm_root /nfs_gaoyang/LBM_dataset \
+    --output_root /data/LBM_lerobot_skills_dataset \
+    --repo_id lbm-eval-skills \
+    --fps 10 \
+    --use_videos True \
+    --skill_types 'PickAndPlaceBox,BimanualPutSpatulaOnPlateFromDryingRack,PlaceCupOnCoaster,BimanualStackPlatesOnTableFromTable,PutGreenAppleInCenterOfTable,PutKiwiInCenterOfTable,BimanualPlaceFruitFromBowlIntoBin,BimanualLayCerealBoxOnCuttingBoardFromTopShelf,BimanualLayCerealBoxOnCuttingBoardFromUnderShelf,BimanualPutSpatulaOnPlateFromTable,BimanualHangMugsOnMugHolderFromDryingRack,BimanualPlaceAppleFromBowlIntoBin,BimanualHangMugsOnMugHolderFromTable,BimanualPlaceAppleFromBowlOnCuttingBoard,BimanualPlaceFruitFromBowlOnCuttingBoard,PutBananaInCenterOfTable,PushCoasterToCenterOfTable,TurnMugRightsideUp,BimanualPutMugsOnPlatesFromTable,BimanualPlacePearFromBowlIntoBin,BimanualPutSpatulaOnTableFromDryingRack,BimanualPutMugsOnPlatesFromDryingRack,BimanualPlaceAvocadoFromBowlIntoBin,BimanualStackPlatesOnTableFromDryingRack,BimanualPutSpatulaOnPlateFromUtensilCrock,BimanualStoreCerealBoxUnderShelf,BimanualPutSpatulaOnTableFromUtensilCrock,PushCoasterToMug,SeparateFruitsVegetablesIntoContainers,DumpVegetablesFromSmallToLargeContainer,BimanualPlacePearFromBowlOnCuttingBoard,PutContainersOnPlate,BimanualPutRedBellPepperInBin,PutCupOnSaucer,PutKiwiOnSaucer,PutMugInCenterOfTable,PutOrangeInCenterOfTable,PutOrangeOnSaucer,PutSpatulaInUtensilCrock,PutSpatulaInUtensilCrockFromDryingRack,PutFruitInLargeContainerAndCoverWithPlate,BimanualPlaceAvocadoFromBowlOnCuttingBoard,TurnLargeContainerUpsideDown,TurnCupUpsideDown,PlaceCupByCoaster,PutBananaOnSaucer,PutCupInCenterOfTable,PutGreenAppleOnSaucer,PutMugOnSaucer' \
+    --state_keys "robot__actual__poses__left::panda__xyz,robot__actual__poses__left::panda__rot_6d,robot__actual__poses__right::panda__xyz,robot__actual__poses__right::panda__rot_6d,robot__actual__grippers__left::panda_hand,robot__actual__grippers__right::panda_hand" \
+    --keep_cameras scene_left_0,scene_right_0,wrist_left_plus,wrist_right_minus \
+    --num_workers 20 \
+    --merge_datasets \
+    --merged_repo_id lbm-eval-merged \
+    --overwrite

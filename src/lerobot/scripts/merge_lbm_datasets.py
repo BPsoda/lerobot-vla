@@ -6,6 +6,7 @@ import logging
 from pathlib import Path
 import subprocess
 import sys
+import argparse
 from collections import defaultdict
 
 # ==============================================================================
@@ -32,6 +33,11 @@ RESIZED_SUFFIX = "_resized"
 # ==============================================================================
 
 def main():
+    parser = argparse.ArgumentParser(description="Merge LBM datasets by split type")
+    parser.add_argument("--dry-run", action="store_true", help="Dry run mode: write merge plans to txt files instead of merging")
+    parser.add_argument("--output-dir", type=str, default=None, help="Directory to save dry-run output files (default: dataset_root)")
+    args = parser.parse_args()
+    
     logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
     
     dataset_root = DEFAULT_DATASET_ROOT
@@ -78,44 +84,60 @@ def main():
         
         final_merge_lists[split_key] = sorted(selected_repos)
 
-    # 4. 执行合并操作
+    # 4. 执行合并操作或写入 dry-run 文件
+    output_dir = Path(args.output_dir) if args.output_dir else dataset_root
+    
     for split_key, repo_list in final_merge_lists.items():
         target_repo = SPLIT_GROUPS[split_key]
         if not repo_list:
             logging.warning(f"No datasets found for group {split_key}. Skipping.")
             continue
-        if (dataset_root / target_repo).exists():
-            logging.info(f"Target repository {target_repo} already exists. Skipping.")
-            continue
-            
-        logging.info(f"--- Merging group [{split_key}] into [{target_repo}] ---")
-        logging.info(f"Source datasets ({len(repo_list)}): {repo_list}")
         
-        # 构造 lerobot_edit_dataset 命令
-        cmd = [
-            sys.executable, "-m", "lerobot.scripts.lerobot_edit_dataset",
-            "--repo_id", target_repo,
-            "--root", str(dataset_root),
-            "--operation.type", "merge",
-            "--operation.repo_ids", json.dumps(repo_list)
-        ]
-        
-        # 设置环境变量
-        env = os.environ.copy()
-        project_root = Path(__file__).resolve().parent.parent.parent.parent
-        src_path = project_root / "src"
-        if "PYTHONPATH" in env:
-            env["PYTHONPATH"] = f"{src_path}:{env['PYTHONPATH']}"
+        if args.dry_run:
+            # Dry-run mode: write to txt file
+            output_file = output_dir / f"merge_plan_{split_key}.txt"
+            with open(output_file, "w") as f:
+                f.write(",".join(repo_list))
+            logging.info(f"[DRY-RUN] Wrote merge plan for {split_key} to {output_file}")
+            logging.info(f"  Target: {target_repo}")
+            logging.info(f"  Sources ({len(repo_list)}): {repo_list}")
         else:
-            env["PYTHONPATH"] = str(src_path)
-        
-        try:
-            subprocess.run(cmd, env=env, check=True)
-            logging.info(f"Successfully merged {target_repo}")
-        except subprocess.CalledProcessError as e:
-            logging.error(f"Failed to merge {target_repo}. Error code: {e.returncode}")
+            # Actual merge mode
+            if (dataset_root / target_repo).exists():
+                logging.info(f"Target repository {target_repo} already exists. Skipping.")
+                continue
+                
+            logging.info(f"--- Merging group [{split_key}] into [{target_repo}] ---")
+            logging.info(f"Source datasets ({len(repo_list)}): {repo_list}")
+            
+            # 构造 lerobot_edit_dataset 命令
+            cmd = [
+                sys.executable, "-m", "lerobot.scripts.lerobot_edit_dataset",
+                "--repo_id", target_repo,
+                "--root", str(dataset_root),
+                "--operation.type", "merge",
+                "--operation.repo_ids", json.dumps(repo_list)
+            ]
+            
+            # 设置环境变量
+            env = os.environ.copy()
+            project_root = Path(__file__).resolve().parent.parent.parent.parent
+            src_path = project_root / "src"
+            if "PYTHONPATH" in env:
+                env["PYTHONPATH"] = f"{src_path}:{env['PYTHONPATH']}"
+            else:
+                env["PYTHONPATH"] = str(src_path)
+            
+            try:
+                subprocess.run(cmd, env=env, check=True)
+                logging.info(f"Successfully merged {target_repo}")
+            except subprocess.CalledProcessError as e:
+                logging.error(f"Failed to merge {target_repo}. Error code: {e.returncode}")
 
-    logging.info("All merging tasks completed.")
+    if args.dry_run:
+        logging.info("Dry-run completed. Check merge plan files in output directory.")
+    else:
+        logging.info("All merging tasks completed.")
 
 if __name__ == "__main__":
     main()

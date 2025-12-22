@@ -1,0 +1,12 @@
+lbm-eval-skills-bimanualhangmugsonmugholderfromtable_iid:
+lbm-eval-skills-bimanualplacefruitfrombowlintobin_iid:
+lbm-eval-skills-bimanualputmugsonplatesfromtable_iid:
+lbm-eval-skills-bimanualstorecerealboxundershelf_iid:
+lbm-eval-skills-dumpvegetablesfromsmalltolargecontainer_iid_resized:
+lbm-eval-skills-putcontainersonplate_iid_resized:
+lbm-eval-skills-putcupincenteroftable_iid_resized:
+lbm-eval-skills-putcuponsaucer_iid_resized:
+lbm-eval-skills-putfruitinlargecontainerandcoverwithplate_iid_resized:
+lbm-eval-skills-putmugincenteroftable_iid_resized:
+lbm-eval-skills-putspatulainutensilcrockfromdryingrack_iid:
+lbm-eval-skills-turncupupsidedown_iid_resized:

@@ -1,0 +1,34 @@
+# LD_LIBRARY_PATH=/root/miniforge3/envs/smolvla/lib:$LD_LIBRARY_PATH TOKENIZERS_PARALLELISM=false accelerate launch python src/lerobot/scripts/lerobot_train.py \
+#     --policy.type=smolvla \
+#     --policy.push_to_hub=false \
+#     --dataset.repo_id=lbm-eval-skills-pickandplacebox_train_resized \
+#     --dataset.root=/nfs_gaoyang/LBM_lerobot_dataset/LBM_lerobot_skills_dataset/lbm-eval-skills-pickandplacebox_train_resized \
+#     --dataset.video_backend=torchcodec-gpu \
+#     --batch_size=64 \
+#     --num_workers=16 \
+#     --steps=20000 \
+#     --output_dir=outputs/train/lbm-eval-skills-pickandplacebox-$(date +%Y-%m-%d-%H-%M-%S) \
+#     --job_name=lbm-eval-skills-pickandplacebox-$(date +%Y-%m-%d-%H-%M-%S) \
+#     --policy.device=cuda \
+#     --wandb.enable=true
+LD_LIBRARY_PATH=/root/miniforge3/envs/smolvla/lib:$LD_LIBRARY_PATH TOKENIZERS_PARALLELISM=false accelerate launch src/lerobot/scripts/lerobot_train.py \
+    --policy.type=smolvla \
+    --policy.push_to_hub=false \
+    --dataset.repo_id=lbm-eval-train \
+    --dataset.root=/nfs_gaoyang/LBM_lerobot_dataset/lbm-eval-train \
+    --dataset.video_backend=torchcodec \
+    --log_freq=10 \
+    --save_checkpoint=true \
+    --save_freq=1000 \
+    --batch_size=64 \
+    --num_workers=12 \
+    --steps=20000 \
+    --output_dir=outputs/train/lbm-eval-train-smolvla-$(date +%Y-%m-%d-%H-%M-%S) \
+    --job_name=lbm-eval-train-smolvla-$(date +%Y-%m-%d-%H-%M-%S) \
+    --policy.device=cuda \
+    --wandb.enable=true \
+    --wandb.disable_artifact=true
+    # --validate_dataset.repo_id=lbm-eval-iid \
+    # --validate_dataset.root=/nfs_gaoyang/LBM_lerobot_dataset/lbm-eval-iid \
+    # --validate_dataset.video_backend=torchcodec \
+    # --validate_freq=1000 \

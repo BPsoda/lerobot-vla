@@ -19,6 +19,8 @@ import re
 from glob import glob
 from pathlib import Path
 
+import numpy as np
+import torch
 from huggingface_hub.constants import SAFETENSORS_SINGLE_FILE
 from termcolor import colored
 
@@ -137,6 +139,17 @@ class WandBLogger:
                 self._wandb.define_metric(new_custom_key, hidden=True)
 
         for k, v in d.items():
+            if isinstance(v, torch.Tensor):
+                if v.numel() == 1:
+                    v = v.item()
+                else:
+                    v = v.mean().item()
+            elif isinstance(v, np.ndarray):
+                if v.size == 1:
+                    v = v.item()
+                else:
+                    v = v.mean().item()
+
             if not isinstance(v, (int | float | str)):
                 logging.warning(
                     f'WandB logging of key "{k}" was ignored as its type "{type(v)}" is not handled by this wrapper.'

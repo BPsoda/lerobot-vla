@@ -189,8 +189,17 @@ class VideoDecoderCache:
 
         with self._lock:
             if video_path not in self._cache:
-                file_handle = fsspec.open(video_path).__enter__()
-                decoder = VideoDecoder(file_handle, seek_mode="approximate")
+                # torchcodec doesn't support fsspec file handles. It only supports str, Path, bytes and Tensor.
+                # Since most use cases are local files, we pass the path directly.
+                # If fsspec is needed for remote files, torchcodec would need additional handling (e.g. downloading to a temp file).
+                try:
+                    decoder = VideoDecoder(video_path, seek_mode="approximate")
+                    file_handle = None
+                except (TypeError, ValueError):
+                    # Fallback to fsspec for other source types, though torchcodec support is limited
+                    file_handle = fsspec.open(video_path).__enter__()
+                    decoder = VideoDecoder(file_handle, seek_mode="approximate")
+
                 self._cache[video_path] = (decoder, file_handle)
 
             return self._cache[video_path][0]
@@ -199,7 +208,8 @@ class VideoDecoderCache:
         """Clear the cache and close file handles."""
         with self._lock:
             for _, file_handle in self._cache.values():
-                file_handle.close()
+                if file_handle is not None:
+                    file_handle.close()
             self._cache.clear()
 
     def size(self) -> int:
@@ -253,8 +263,12 @@ def decode_video_frames_torchcodec(
     # get metadata for frame information
     metadata = decoder.metadata
     average_fps = metadata.average_fps
+    # get total number of frames to clamp indices
+    num_frames = len(decoder)
     # convert timestamps to frame indices
     frame_indices = [round(ts * average_fps) for ts in timestamps]
+    # clamp frame indices to valid range [0, num_frames - 1]
+    frame_indices = [min(max(idx, 0), num_frames - 1) for idx in frame_indices]
     # retrieve frames based on indices
     frames_batch = decoder.get_frames_at(indices=frame_indices)
 

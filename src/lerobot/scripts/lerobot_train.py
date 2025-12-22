@@ -52,7 +52,6 @@ from lerobot.utils.utils import (
     init_logging,
 )
 
-
 def update_policy(
     train_metrics: MetricsTracker,
     policy: PreTrainedPolicy,
@@ -190,6 +189,18 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
     if not is_main_process:
         dataset = make_dataset(cfg)
 
+    # Validation dataset loading synchronization
+    validate_dataset = None
+    if cfg.validate_dataset:
+        if is_main_process:
+            logging.info("Creating validation dataset")
+            validate_dataset = make_dataset(cfg, dataset_cfg=cfg.validate_dataset)
+
+        accelerator.wait_for_everyone()
+
+        if not is_main_process:
+            validate_dataset = make_dataset(cfg, dataset_cfg=cfg.validate_dataset)
+
     # Create environment used for evaluating checkpoints during training on simulation data.
     # On real-world data, no need to create an environment as evaluations are done outside train.py,
     # using the eval.py instead, with gym_dora environment and dora-rs.
@@ -298,11 +309,44 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         prefetch_factor=2 if cfg.num_workers > 0 else None,
     )
 
+    # create dataloader for validation
+    validate_dataloader = None
+    validate_dl_iter = None
+    if validate_dataset:
+        if hasattr(cfg.policy, "drop_n_last_frames"):
+            v_shuffle = False
+            v_sampler = EpisodeAwareSampler(
+                validate_dataset.meta.episodes["dataset_from_index"],
+                validate_dataset.meta.episodes["dataset_to_index"],
+                episode_indices_to_use=validate_dataset.episodes,
+                drop_n_last_frames=cfg.policy.drop_n_last_frames,
+                shuffle=True,
+            )
+        else:
+            v_shuffle = True
+            v_sampler = None
+
+        validate_dataloader = torch.utils.data.DataLoader(
+            validate_dataset,
+            num_workers=cfg.num_workers,
+            batch_size=cfg.batch_size,
+            shuffle=v_shuffle and not cfg.validate_dataset.streaming,
+            sampler=v_sampler,
+            pin_memory=device.type == "cuda",
+            drop_last=False,
+            prefetch_factor=2 if cfg.num_workers > 0 else None,
+        )
+
     # Prepare everything with accelerator
     accelerator.wait_for_everyone()
-    policy, optimizer, dataloader, lr_scheduler = accelerator.prepare(
-        policy, optimizer, dataloader, lr_scheduler
-    )
+    if validate_dataloader:
+        policy, optimizer, dataloader, validate_dataloader, lr_scheduler = accelerator.prepare(
+            policy, optimizer, dataloader, validate_dataloader, lr_scheduler
+        )
+    else:
+        policy, optimizer, dataloader, lr_scheduler = accelerator.prepare(
+            policy, optimizer, dataloader, lr_scheduler
+        )
     dl_iter = cycle(dataloader)
 
     policy.train()
@@ -350,6 +394,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
         step += 1
         train_tracker.step()
         is_log_step = cfg.log_freq > 0 and step % cfg.log_freq == 0 and is_main_process
+        is_validate_step = cfg.validate_dataset and step % cfg.validate_freq == 0
         is_saving_step = step % cfg.save_freq == 0 or step == cfg.steps
         is_eval_step = cfg.eval_freq > 0 and step % cfg.eval_freq == 0
 
@@ -361,6 +406,27 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                     wandb_log_dict.update(output_dict)
                 wandb_logger.log_dict(wandb_log_dict, step)
             train_tracker.reset_averages()
+
+        if is_validate_step:
+            policy.eval()
+            val_loss_meter = AverageMeter("val_loss", ":.3f")
+            for v_batch in validate_dataloader:
+                with torch.no_grad(), accelerator.autocast():
+                    v_batch = preprocessor(v_batch)
+                    v_loss, _ = policy.forward(v_batch)
+                    # Use the batch size of the first feature to weight the average
+                    batch_size = next(iter(v_batch.values())).shape[0] if isinstance(v_batch, dict) else 1
+                    val_loss_meter.update(v_loss.item(), n=batch_size)
+
+            # Sync validation loss across processes
+            v_loss_tensor = torch.tensor(val_loss_meter.avg, device=device)
+            v_loss_avg = accelerator.reduce(v_loss_tensor, reduction="mean").item()
+
+            if is_main_process:
+                logging.info(f"Step {step}: validation loss: {v_loss_avg:.3f}")
+                if wandb_logger:
+                    wandb_logger.log_dict({"val_loss": v_loss_avg}, step)
+            policy.train()
 
         if cfg.save_checkpoint and is_saving_step:
             if is_main_process:
