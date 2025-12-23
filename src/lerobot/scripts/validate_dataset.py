@@ -2,6 +2,7 @@
 
 import argparse
 import logging
+import sys
 from pathlib import Path
 from tqdm import tqdm
 import torch
@@ -14,6 +15,7 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
 DEFAULT_DATASET_ROOT = Path("/nfs_gaoyang/LBM_lerobot_dataset/LBM_lerobot_skills_dataset")
 DEFAULT_MERGE_PLAN_FILE = Path("/nfs_gaoyang/LBM_lerobot_dataset/dataset_lists/merge_plan_iid.txt")
+DEFAULT_LOG_FILE = "validate.out"
 
 # ==============================================================================
 # Validation Logic
@@ -85,26 +87,48 @@ def main():
                         help="Root directory containing datasets")
     parser.add_argument("--tolerance-s", type=float, default=0.2,
                         help="Tolerance for timestamp matching")
+    parser.add_argument("--log-file", type=str, default=DEFAULT_LOG_FILE,
+                        help="Path to log file (default: validate.out)")
     args = parser.parse_args()
     
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s [%(levelname)s] %(message)s'
-    )
+    # Setup logging to both console and file
+    log_format = '%(asctime)s [%(levelname)s] %(message)s'
+    
+    # Create logger
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
+    
+    # Remove existing handlers
+    logger.handlers.clear()
+    
+    # Console handler
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(logging.Formatter(log_format))
+    logger.addHandler(console_handler)
+    
+    # File handler
+    log_file_path = Path(args.log_file)
+    file_handler = logging.FileHandler(log_file_path, mode='w', encoding='utf-8')
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(logging.Formatter(log_format))
+    logger.addHandler(file_handler)
+    
+    logging.info(f"Logging to file: {log_file_path}")
     
     merge_plan_file = Path(args.merge_plan_file)
     dataset_root = Path(args.dataset_root)
     
     if not merge_plan_file.exists():
         logging.error(f"Merge plan file not found: {merge_plan_file}")
-        return
+        return 1
     
     # Read dataset IDs from file
     with open(merge_plan_file, "r") as f:
         content = f.read().strip()
         if not content:
             logging.error("Merge plan file is empty")
-            return
+            return 1
         
         # Split by comma and clean up whitespace
         repo_ids = [repo_id.strip() for repo_id in content.split(",") if repo_id.strip()]
@@ -138,9 +162,11 @@ def main():
         for repo_id, is_valid, message in results:
             if not is_valid:
                 logging.info(f"  - {repo_id}: {message}")
+        logging.info(f"\nFull log saved to: {log_file_path}")
         return 1
     else:
         logging.info("All datasets are valid!")
+        logging.info(f"Full log saved to: {log_file_path}")
         return 0
 
 if __name__ == "__main__":
