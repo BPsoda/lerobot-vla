@@ -6,6 +6,13 @@ A policy wrapper for LBM Eval that supports multiple VLA models (pi0.5, groot, s
 This wrapper converts between LBM Eval's MultiarmObservation/PosesAndGrippers format
 and LeRobot's observation/action format, and serves inference via gRPC.
 
+IMPORTANT: Format Consistency with Training Dataset
+- Observation state format: [left_xyz(3), left_rot6d(6), right_xyz(3), right_rot6d(6), left_gripper(1), right_gripper(1)]
+  (left first, right second - matches training dataset)
+- Action format: [right_xyz(3), right_rot6d(6), left_xyz(3), left_rot6d(6), right_gripper(1), left_gripper(1)]
+  (right first, left second - matches training dataset)
+Note: The order differs between state and action to match the training dataset format.
+
 Usage:
     python -m lerobot.scripts.lbm_eval_policy_server \
         --model-type pi05 \
@@ -34,6 +41,7 @@ try:
         LbmPolicyServerConfig,
         run_policy_server,
     )
+    from grpc_workspace.lbm_policy_conversions import array_to_rotation_matrix
     from robot_gym.multiarm_spaces import MultiarmObservation, PosesAndGrippers
     from robot_gym.policy import Policy, PolicyMetadata
 except ImportError as e:
@@ -191,12 +199,50 @@ def convert_multiarm_observation_to_lerobot(
         
         # Extract robot state if available
         # Try to get poses and construct state vector
-        # Expected format: [right_xyz(3), right_rot6d(6), left_xyz(3), left_rot6d(6), right_gripper(1), left_gripper(1)] = 20 dims
+        # NOTE: Dataset format has left first, then right in observation state
+        # Expected format: [left_xyz(3), left_rot6d(6), right_xyz(3), right_rot6d(6), left_gripper(1), right_gripper(1)] = 20 dims
+        # This matches the training dataset format (left first, right second)
         if hasattr(actual, "poses") and actual.poses:
             state_components = []
-            robot_names = sorted(actual.poses.keys())
+            available_robot_names = list(actual.poses.keys())
             
-            # Process each robot in sorted order (right, left)
+            # Determine robot order: left first, then right (to match dataset format)
+            # This is different from action format which is right first, then left
+            robot_order = []
+            left_robot = None
+            right_robot = None
+            
+            # Try to identify which robot is "left" and which is "right"
+            for name in available_robot_names:
+                name_lower = name.lower()
+                if "left" in name_lower:
+                    left_robot = name
+                elif "right" in name_lower:
+                    right_robot = name
+            
+            # Build order: left first, then right (to match dataset observation format)
+            if left_robot and right_robot:
+                robot_order = [left_robot, right_robot]
+                # robot_order = [right_robot, left_robot]  # debug
+                logger.debug(f"State: Using robot order {robot_order} (left first, right second) to match dataset format")
+            elif len(available_robot_names) == 2:
+                # Fallback: use sorted order (left comes before right alphabetically)
+                robot_order = sorted(available_robot_names)
+                logger.warning(
+                    f"Could not identify left/right robots for state. Using sorted order: {robot_order}. "
+                    "Assuming first is left, second is right to match dataset format."
+                )
+            else:
+                # Single robot or unexpected number
+                robot_order = sorted(available_robot_names)
+                logger.warning(
+                    f"Unexpected number of robots: {len(available_robot_names)}. "
+                    f"Using sorted order: {robot_order}"
+                )
+            
+            robot_names = robot_order
+            
+            # Process each robot in the determined order (left first, then right)
             for robot_name in robot_names:
                 pose = actual.poses[robot_name]
                 # Extract translation (xyz) - 3 dims
@@ -294,14 +340,27 @@ def convert_multiarm_observation_to_lerobot(
                 if state_tensor.shape[0] != 20:
                     logger.warning(
                         f"Observation state dimension mismatch: expected 20, got {state_tensor.shape[0]}. "
-                        f"Robot names: {robot_names}, Components: {[c.shape for c in state_components]}"
+                        f"Robot names (order): {robot_names}, Components: {[c.shape for c in state_components]}. "
+                        f"Expected format (dataset): [left_xyz(3), left_rot6d(6), right_xyz(3), right_rot6d(6), left_gripper(1), right_gripper(1)]"
                     )
                     # Pad or truncate to 20 dims if needed
                     if state_tensor.shape[0] < 20:
                         padding = torch.zeros(20 - state_tensor.shape[0], dtype=torch.float32)
                         state_tensor = torch.cat([state_tensor, padding], dim=0)
+                        logger.warning(f"Padded state tensor to 20 dims")
                     else:
                         state_tensor = state_tensor[:20]
+                        logger.warning(f"Truncated state tensor to 20 dims")
+                else:
+                    # Log the actual state structure for debugging
+                    # Format: [left_xyz(3), left_rot6d(6), right_xyz(3), right_rot6d(6), left_gripper(1), right_gripper(1)]
+                    logger.debug(
+                        f"State tensor constructed successfully. "
+                        f"Robot order: {robot_names} (left first, right second to match dataset), "
+                        f"Format: [{robot_names[0]}_xyz(3), {robot_names[0]}_rot6d(6), "
+                        f"{robot_names[1]}_xyz(3), {robot_names[1]}_rot6d(6), "
+                        f"{robot_names[0]}_gripper(1), {robot_names[1]}_gripper(1)]"
+                    )
                 
                 state_tensor = state_tensor.unsqueeze(0)  # Add batch dimension
                 state_tensor = state_tensor.to(device)
@@ -358,6 +417,12 @@ def convert_action_to_poses_and_grippers(
     left_rot6d = action_np[12:18]
     right_gripper = float(action_np[18])
     left_gripper = float(action_np[19])
+    # left_xyz = action_np[0:3]
+    # left_rot6d = action_np[3:9]
+    # right_xyz = action_np[9:12]
+    # right_rot6d = action_np[12:18]
+    # left_gripper = float(action_np[18]) # debug
+    # right_gripper = float(action_np[19]) # debug
     
     # Convert 6D rotation to rotation matrix
     right_rot_matrix = rot6d_to_rotation_matrix(right_rot6d)
@@ -375,50 +440,53 @@ def convert_action_to_poses_and_grippers(
     ) -> RigidTransform:
         """Create a new Pose or copy and update an existing one."""
         if reference_poses and robot_name in reference_poses:
-            # Copy existing pose and update it
-            pose = copy.deepcopy(reference_poses[robot_name])
-            pose.set_translation(translation)
-            # Update rotation - try different methods based on Pose API
-            if hasattr(pose, "set_rotation_matrix"):
-                pose.set_rotation_matrix(rotation_matrix)
-        elif hasattr(pose, "set_rotation"):
-            # Try using scipy Rotation object
-            try:
-                from scipy.spatial.transform import Rotation  # type: ignore
-                rotation = Rotation.from_matrix(rotation_matrix)
-                pose.set_rotation(rotation)
-            except (ImportError, AttributeError):
-                # If scipy not available or set_rotation doesn't accept Rotation,
-                # try to get rotation from pose and update it
-                if hasattr(pose, "rotation"):
-                    current_rotation = pose.rotation()
-                    # Try to update rotation in place if possible
-                    logger.warning(
-                        f"Could not set rotation for {robot_name} pose. "
-                        "Rotation matrix conversion may not be fully supported."
-                    )
-            else:
-                logger.warning(
-                    f"Pose object for {robot_name} does not have set_rotation_matrix or set_rotation methods. "
-                    "Rotation may not be updated correctly."
-                )
+            # convert rotation matrix to pydrake rotation
+            rotation = array_to_rotation_matrix(rotation_matrix.flatten())
+            pose = RigidTransform(R=rotation, p=translation)
+            
+            # # Update rotation - try different methods based on Pose API
+            # if hasattr(pose, "set_rotation_matrix"):
+            #     pose.set_rotation_matrix(rotation_matrix)
+        # elif hasattr(pose, "set_rotation"):
+        #     # Try using scipy Rotation object
+        #     try:
+        #         from scipy.spatial.transform import Rotation  # type: ignore
+        #         rotation = Rotation.from_matrix(rotation_matrix)
+        #         pose.set_rotation(rotation)
+        #     except (ImportError, AttributeError):
+        #         # If scipy not available or set_rotation doesn't accept Rotation,
+        #         # try to get rotation from pose and update it
+        #         if hasattr(pose, "rotation"):
+        #             current_rotation = pose.rotation()
+        #             # Try to update rotation in place if possible
+        #             logger.warning(
+        #                 f"Could not set rotation for {robot_name} pose. "
+        #                 "Rotation matrix conversion may not be fully supported."
+        #             )
+        #     else:
+        #         logger.warning(
+        #             f"Pose object for {robot_name} does not have set_rotation_matrix or set_rotation methods. "
+        #             "Rotation may not be updated correctly."
+        #         )
+        # else:
+        #     # Create new pose
+        #     pose = RigidTransform()
+        #     pose.set_translation(translation)
+        #     # Set rotation
+        #     if hasattr(pose, "set_rotation_matrix"):
+        #         pose.set_rotation_matrix(rotation_matrix)
+        #     elif hasattr(pose, "set_rotation"):
+        #         try:
+        #             from scipy.spatial.transform import Rotation  # type: ignore
+        #             rotation = Rotation.from_matrix(rotation_matrix)
+        #             pose.set_rotation(rotation)
+        #         except (ImportError, AttributeError):
+        #             logger.warning(
+        #                 f"Could not set rotation for new {robot_name} pose. "
+        #                 "Rotation may not be initialized correctly."
+        #             )
         else:
-            # Create new pose
-            pose = RigidTransform()
-            pose.set_translation(translation)
-            # Set rotation
-            if hasattr(pose, "set_rotation_matrix"):
-                pose.set_rotation_matrix(rotation_matrix)
-            elif hasattr(pose, "set_rotation"):
-                try:
-                    from scipy.spatial.transform import Rotation  # type: ignore
-                    rotation = Rotation.from_matrix(rotation_matrix)
-                    pose.set_rotation(rotation)
-                except (ImportError, AttributeError):
-                    logger.warning(
-                        f"Could not set rotation for new {robot_name} pose. "
-                        "Rotation may not be initialized correctly."
-                    )
+            raise ValueError(f"Could not create or update pose for {robot_name}, reference_poses: {reference_poses}.")
         
         return pose
     
@@ -602,27 +670,62 @@ class VLAPolicy(Policy):
         
         lock_context = self.policy_lock if self.policy_lock else nullcontext()
         with lock_context:
-            with torch.inference_mode():
+            logger.debug("Lock acquired, starting inference")
+            with torch.no_grad():
                 if self.rtc_enabled:
                     # Use RTC mode: predict_action_chunk with RTC parameters
+                    logger.debug("Using RTC mode")
                     action_tensor = self._step_with_rtc(lerobot_obs)
                 else:
                     # Use standard mode: predict_action_chunk and manage queue ourselves
                     # This avoids conflicts when sharing policy instance across sessions
+                    logger.debug("Using standard mode")
                     action_tensor = self._step_without_rtc(lerobot_obs)
         
         # Apply postprocessor
+        logger.debug("Applying postprocessor")
         action_tensor = self.postprocessor(action_tensor)
         
         # Convert action to PosesAndGrippers format
         # Extract robot names, reference poses, and gripper keys from observation if available
+        # IMPORTANT: robot_names order for action must be right first, then left
+        # This matches action format: [right_xyz(3), right_rot6d(6), left_xyz(3), left_rot6d(6), right_gripper(1), left_gripper(1)]
+        # Note: This is different from state format which is left first, then right
         robot_names = None
         reference_poses = None
         reference_grippers = None
         if hasattr(observation, "robot") and hasattr(observation.robot, "actual"):
             actual = observation.robot.actual
             if hasattr(actual, "poses"):
-                robot_names = sorted(list(actual.poses.keys()))
+                # For action conversion, we need right first, then left (to match action format)
+                available_robot_names = list(actual.poses.keys())
+                right_robot = None
+                left_robot = None
+                
+                for name in available_robot_names:
+                    name_lower = name.lower()
+                    if "right" in name_lower:
+                        right_robot = name
+                    elif "left" in name_lower:
+                        left_robot = name
+                
+                if right_robot and left_robot:
+                    robot_names = [right_robot, left_robot]  # right first, left second (for action format)
+                    # robot_names = [left_robot, right_robot] # debug
+                    logger.debug(f"Action: Using robot order {robot_names} (right first, left second) to match action format")
+                else:
+                    # Fallback: try to determine order
+                    # If sorted order gives left first, reverse it to get right first
+                    sorted_names = sorted(available_robot_names)
+                    if len(sorted_names) == 2 and "left" in sorted_names[0].lower():
+                        robot_names = [sorted_names[1], sorted_names[0]]  # Reverse to get right first
+                    else:
+                        robot_names = sorted_names
+                    logger.warning(
+                        f"Could not identify right/left robots for action conversion. "
+                        f"Using order: {robot_names}. Assuming first is right, second is left."
+                    )
+                
                 reference_poses = actual.poses
             if hasattr(actual, "grippers"):
                 reference_grippers = actual.grippers
@@ -768,6 +871,7 @@ class VLAPolicyBatch(Policy):
         device: torch.device,
         model_type: str,
         rtc_enabled_override: bool | None = None,
+        compile_model_override: bool | None = None,
     ):
         """Initialize batch policy wrapper.
         
@@ -778,17 +882,32 @@ class VLAPolicyBatch(Policy):
             model_type: Model type name (pi05, groot, smolvla)
             rtc_enabled_override: If True/False, override RTC setting from config.
                                  If None, use config setting.
+            compile_model_override: If True/False, override compile_model setting from config.
+                                   If None, use config setting. Only applies to pi05 and pi0 models.
         """
         self.policy_class = policy_class
         self.checkpoint_path = checkpoint_path
         self.device = device
         self.model_type = model_type
         self.rtc_enabled_override = rtc_enabled_override
+        self.compile_model_override = compile_model_override
         
         # Load a SINGLE shared policy instance to save GPU memory
         # All sessions will share this policy instance for inference
         logger.info("Loading shared policy instance (will be shared across all sessions)")
-        self.shared_policy = policy_class.from_pretrained(checkpoint_path)
+        
+        # Override compile_model config if specified (only for pi05 and pi0)
+        config = None
+        if compile_model_override is not None and model_type in ("pi05", "pi0"):
+            from lerobot.configs.policies import PreTrainedConfig
+            config = PreTrainedConfig.from_pretrained(checkpoint_path)
+            config.compile_model = compile_model_override
+            logger.info(f"Overriding compile_model to {compile_model_override} for {model_type}")
+        
+        if config is not None:
+            self.shared_policy = policy_class.from_pretrained(checkpoint_path, config=config)
+        else:
+            self.shared_policy = policy_class.from_pretrained(checkpoint_path)
         self.shared_policy.to(device)
         self.shared_policy.eval()
         
@@ -921,6 +1040,19 @@ def main():
         default=False,
         help="Disable RTC (Real-Time Chunking). Overrides --enable-rtc if both are specified.",
     )
+    parser.add_argument(
+        "--compile-model",
+        action="store_true",
+        help="Enable torch.compile for model optimization. Only applies to pi05 and pi0 models. "
+             "If not specified, uses model config setting.",
+    )
+    parser.add_argument(
+        "--no-compile-model",
+        action="store_true",
+        default=False,
+        help="Disable torch.compile for model optimization. Only applies to pi05 and pi0 models. "
+             "Overrides --compile-model if both are specified.",
+    )
     
     args = parser.parse_args()
     
@@ -934,6 +1066,24 @@ def main():
         logger.info("RTC explicitly enabled via --enable-rtc")
     else:
         logger.info("RTC setting will be determined from model config")
+    
+    # Determine compile_model setting: --no-compile-model takes precedence over --compile-model
+    compile_model_override = None
+    if args.no_compile_model or args.compile_model:
+        if args.model_type not in ("pi05", "pi0"):
+            logger.warning(
+                f"compile_model option is only supported for pi05 and pi0 models, "
+                f"but model type is {args.model_type}. Ignoring compile_model option."
+            )
+        else:
+            if args.no_compile_model:
+                compile_model_override = False
+                logger.info("compile_model explicitly disabled via --no-compile-model")
+            elif args.compile_model:
+                compile_model_override = True
+                logger.info("compile_model explicitly enabled via --compile-model")
+    else:
+        logger.info("compile_model setting will be determined from model config")
     
     # Validate checkpoint path
     checkpoint_path = args.checkpoint_path
@@ -970,6 +1120,7 @@ def main():
         device=device,
         model_type=args.model_type,
         rtc_enabled_override=rtc_enabled_override,
+        compile_model_override=compile_model_override,
     )
     
     logger.info("Policy wrapper initialized successfully")
