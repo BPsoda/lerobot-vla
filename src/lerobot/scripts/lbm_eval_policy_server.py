@@ -34,6 +34,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import cv2
 
 # LBM Eval imports (external dependency)
 try:
@@ -130,6 +131,35 @@ def rotation_matrix_to_rot6d(rot_matrix: np.ndarray) -> np.ndarray:
     return rot6d
 
 
+IMAGE_SIZE = (480, 640, 3)
+
+def resize_and_pad_image(image: np.ndarray) -> np.ndarray:
+    """
+    Resize and pad an image to the target size (IMAGE_SIZE) with zero padding,
+    keeping the aspect ratio unchanged (no stretched distortion).
+    """
+    target_h, target_w, target_c = IMAGE_SIZE
+    h, w = image.shape[:2]
+
+    # 计算缩放比例，保持长宽比
+    scale = min(target_h / h, target_w / w)
+    new_h, new_w = int(round(h * scale)), int(round(w * scale))
+
+    if image.shape[-1] != target_c:
+        raise ValueError(f"Input image has {image.shape[-1]} channels, expected {target_c}")
+    resized = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+
+    # 创建全零的目标尺寸图像
+    out = np.zeros((target_h, target_w, target_c), dtype=image.dtype)
+
+    # 计算在目标图像中心位置安放resized图像的起始点
+    y_start = (target_h - new_h) // 2
+    x_start = (target_w - new_w) // 2
+
+    # 拷贝缩放后的图片到输出图片
+    out[y_start:y_start+new_h, x_start:x_start+new_w, :] = resized
+    return out
+
 def convert_multiarm_observation_to_lerobot(
     observation: MultiarmObservation,
     device: torch.device,
@@ -164,6 +194,8 @@ def convert_multiarm_observation_to_lerobot(
                 rgb_image = camera_image_set
             
             if rgb_image is not None:
+                # Resize and pad image to target size
+                rgb_image = resize_and_pad_image(rgb_image)
                 # Convert image from (H, W, C) to (C, H, W) and normalize to [0, 1]
                 if isinstance(rgb_image, np.ndarray):
                     image_tensor = torch.from_numpy(rgb_image.copy()).float()
@@ -549,6 +581,8 @@ class VLAPolicy(Policy):
         device: torch.device,
         rtc_enabled_override: bool | None = None,
         policy_lock: Optional[threading.Lock] = None,
+        task_instruction_override: str | None = None,
+        n_action_step: int = 1,
     ):
         """Initialize VLA policy wrapper.
         
@@ -561,12 +595,18 @@ class VLAPolicy(Policy):
                                  If None, use config setting.
             policy_lock: Optional lock to protect shared policy access (for thread safety).
                         If None, no locking is performed (assumes single-threaded or external locking).
+            task_instruction_override: If provided, overrides the task instruction from observation.
+                                      If None, uses observation.language_instruction.
+            n_action_step: Number of action steps to add to queue from the front of action chunk
+                           after each policy predict. Default is 1.
         """
         self.policy = policy
         self.preprocessor = preprocessor
         self.postprocessor = postprocessor
         self.device = device
         self.policy_lock = policy_lock
+        self.task_instruction_override = task_instruction_override
+        self.n_action_step = n_action_step
         self.model_type = getattr(policy, "name", "unknown")
         self.checkpoint_path = getattr(policy.config, "pretrained_path", "unknown")
         
@@ -639,8 +679,15 @@ class VLAPolicy(Policy):
         """
         # Convert observation to LeRobot format
         lerobot_obs = convert_multiarm_observation_to_lerobot(observation, self.device)
+        
+        # Override task instruction if specified
+        if self.task_instruction_override is not None:
+            lerobot_obs["task"] = self.task_instruction_override
+            logger.debug(f"Task instruction overridden: {self.task_instruction_override} (original: {observation.language_instruction})")
+        else:
+            logger.debug(f"Task: {observation.language_instruction}")
+        
         obs_image_keys = [k for k in lerobot_obs.keys() if k.startswith(OBS_IMAGES + ".")]
-        logger.debug(f"Task: {observation.language_instruction}")
         logger.debug(f"Observation keys before preprocessing: {list(lerobot_obs.keys())}")
         logger.debug(f"Observation image keys: {obs_image_keys}")
         logger.debug(f"Policy expected image keys: {sorted(self.expected_image_keys)}")
@@ -653,6 +700,10 @@ class VLAPolicy(Policy):
                 logger.warning(
                     f"Image key mismatch - Missing: {sorted(missing_keys)}, Extra: {sorted(extra_keys)}"
                 )
+            # remove image keys that are not in the expected image keys
+            for key in obs_image_keys:
+                if key not in self.expected_image_keys:
+                    del lerobot_obs[key]
         
         # Apply preprocessor
         lerobot_obs = self.preprocessor(lerobot_obs)
@@ -758,12 +809,14 @@ class VLAPolicy(Policy):
             t_inference_end = time.perf_counter()
             logger.debug(f"Inference time: {t_inference_end - t_inference_start:.2f}s")
             
-            # Add actions to queue
+            # Add actions to queue (only first n_action_step steps from chunk)
             # Shape: (batch_size, chunk_size, action_dim) -> extract timesteps
             if action_chunk.ndim == 3:
                 chunk_size = action_chunk.shape[1]
-                for i in range(chunk_size):
+                n_steps_to_add = min(self.n_action_step, chunk_size)
+                for i in range(n_steps_to_add):
                     self._action_queue.append(action_chunk[:, i, :])
+                logger.debug(f"Added {n_steps_to_add} action steps to queue (chunk size: {chunk_size})")
             else:
                 # Single action case
                 self._action_queue.append(action_chunk)
@@ -829,12 +882,14 @@ class VLAPolicy(Policy):
             inference_time = time.perf_counter() - t_inference_start
             self._inference_delays.append(inference_time)
             
-            # Add actions to queue
-            # Transpose to (chunk_size, batch_size, action_dim) then extract timesteps
+            # Add actions to queue (only first n_action_step steps from chunk)
+            # Shape: (batch_size, chunk_size, action_dim) -> extract timesteps
             if action_chunk.ndim == 3:
                 chunk_size = action_chunk.shape[1]
-                for i in range(chunk_size):
+                n_steps_to_add = min(self.n_action_step, chunk_size)
+                for i in range(n_steps_to_add):
                     self._action_queue.append(action_chunk[:, i, :])
+                logger.debug(f"Added {n_steps_to_add} action steps to queue (chunk size: {chunk_size})")
             else:
                 # Single action case
                 self._action_queue.append(action_chunk)
@@ -872,6 +927,8 @@ class VLAPolicyBatch(Policy):
         model_type: str,
         rtc_enabled_override: bool | None = None,
         compile_model_override: bool | None = None,
+        task_instruction_override: str | None = None,
+        n_action_step: int = 1,
     ):
         """Initialize batch policy wrapper.
         
@@ -884,6 +941,10 @@ class VLAPolicyBatch(Policy):
                                  If None, use config setting.
             compile_model_override: If True/False, override compile_model setting from config.
                                    If None, use config setting. Only applies to pi05 and pi0 models.
+            task_instruction_override: If provided, overrides the task instruction from observation.
+                                     If None, uses observation.language_instruction.
+            n_action_step: Number of action steps to add to queue from the front of action chunk
+                          after each policy predict. Default is 1.
         """
         self.policy_class = policy_class
         self.checkpoint_path = checkpoint_path
@@ -891,6 +952,8 @@ class VLAPolicyBatch(Policy):
         self.model_type = model_type
         self.rtc_enabled_override = rtc_enabled_override
         self.compile_model_override = compile_model_override
+        self.task_instruction_override = task_instruction_override
+        self.n_action_step = n_action_step
         
         # Load a SINGLE shared policy instance to save GPU memory
         # All sessions will share this policy instance for inference
@@ -910,6 +973,8 @@ class VLAPolicyBatch(Policy):
             self.shared_policy = policy_class.from_pretrained(checkpoint_path)
         self.shared_policy.to(device)
         self.shared_policy.eval()
+
+        logger.debug(f"Shared policy config: {self.shared_policy.config}")
         
         # Create preprocessor and postprocessor (also shared)
         self.preprocessor, self.postprocessor = make_pre_post_processors(
@@ -960,6 +1025,8 @@ class VLAPolicyBatch(Policy):
                     device=self.device,
                     rtc_enabled_override=self.rtc_enabled_override,
                     policy_lock=self._policy_lock,  # Pass the lock for thread safety
+                    task_instruction_override=self.task_instruction_override,
+                    n_action_step=self.n_action_step,
                 )
                 self._sub_policies[one_uuid] = vla_policy
             else:
@@ -1053,6 +1120,21 @@ def main():
         help="Disable torch.compile for model optimization. Only applies to pi05 and pi0 models. "
              "Overrides --compile-model if both are specified.",
     )
+    parser.add_argument(
+        "--task-instruction",
+        type=str,
+        default=None,
+        help="Override task instruction from observation. If specified, this will replace "
+             "observation.language_instruction for all inference steps.",
+    )
+    parser.add_argument(
+        "--n-action-step",
+        type=int,
+        default=1,
+        help="Number of action steps to add to queue from the front of action chunk "
+             "after each policy predict. Default is 1. If set to a value larger than "
+             "the chunk size, all steps in the chunk will be added.",
+    )
     
     args = parser.parse_args()
     
@@ -1084,6 +1166,20 @@ def main():
                 logger.info("compile_model explicitly enabled via --compile-model")
     else:
         logger.info("compile_model setting will be determined from model config")
+    
+    # Handle task instruction override
+    task_instruction_override = args.task_instruction if args.task_instruction else None
+    if task_instruction_override:
+        logger.info(f"Task instruction override enabled: '{task_instruction_override}'")
+    else:
+        logger.info("Task instruction will be taken from observation.language_instruction")
+    
+    # Handle n_action_step
+    n_action_step = args.n_action_step
+    if n_action_step < 1:
+        logger.warning(f"n_action_step must be >= 1, got {n_action_step}. Setting to 1.")
+        n_action_step = 1
+    logger.info(f"n_action_step set to {n_action_step} (will add first {n_action_step} steps from chunk to queue)")
     
     # Validate checkpoint path
     checkpoint_path = args.checkpoint_path
@@ -1121,6 +1217,8 @@ def main():
         model_type=args.model_type,
         rtc_enabled_override=rtc_enabled_override,
         compile_model_override=compile_model_override,
+        task_instruction_override=task_instruction_override,
+        n_action_step=n_action_step,
     )
     
     logger.info("Policy wrapper initialized successfully")
