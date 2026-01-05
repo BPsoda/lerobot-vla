@@ -138,6 +138,9 @@ def process_skill(skill_name: str):
             stdout_lines = result.stdout.splitlines()
             if stdout_lines:
                 logging.error(f"[{skill_name}] STDOUT (truncated):\n" + "\n".join(stdout_lines[:20]))
+            # record the failed repo_id 
+            with open("failed_split_lbm_eval_skills_repo_ids.txt", "a") as f:
+                f.write(f"{repo_id}\n")
         else:
             logging.info(f"[{skill_name}] Successfully created splits: {list(splits.keys())}")
             
@@ -173,7 +176,8 @@ def main():
     
     # Process skills using a process pool for efficiency
     # The number of workers is limited by the number of skills and available CPU cores.
-    num_workers = min(len(skills), os.cpu_count() or 4)
+    # num_workers = min(len(skills), os.cpu_count() or 4)
+    num_workers = 12
     logging.info(f"Initializing process pool with {num_workers} workers.")
     
     with Pool(processes=num_workers) as pool:

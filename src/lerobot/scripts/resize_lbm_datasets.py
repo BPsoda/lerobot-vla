@@ -133,7 +133,14 @@ def run_single_repo_cmd(repo_id, dataset_root, target_size, device, suffix):
     ]
     logging.info(f"Spawning subprocess for {repo_id}...")
     # Use same environment to preserve PYTHONPATH
-    subprocess.run(cmd, env=os.environ.copy(), check=True)
+    # TODO: if the subprocess fails, record the repo_id to a file
+    result = subprocess.run(cmd, env=os.environ.copy(), check=True)
+    if result.returncode != 0:
+        logging.error(f"Subprocess for {repo_id} failed: {result.stderr}")
+        with open("failed_resize_lbm_eval_skills_repo_ids.txt", "a") as f:
+            f.write(f"{repo_id}\n")
+    else:
+        logging.info(f"Subprocess for {repo_id} succeeded")
 
 # ==============================================================================
 # Worker Function
@@ -174,7 +181,7 @@ def process_dataset(repo_id: str, dataset_root: Path, target_size: Tuple[int, in
 
         logging.info(f"[{repo_id}] Dimensions mismatch. Resizing to {target_size} using {device}...")
 
-        src_ds = LeRobotDataset(repo_id, root=dataset_path, video_backend="pyav")
+        src_ds = LeRobotDataset(repo_id, root=dataset_path, video_backend="torchcodec")
         new_features = src_ds.meta.features.copy()
         for key in image_keys:
             new_features[key] = new_features[key].copy()
@@ -186,7 +193,7 @@ def process_dataset(repo_id: str, dataset_root: Path, target_size: Tuple[int, in
             features=new_features,
             root=new_dataset_path,
             use_videos=len(src_ds.meta.video_keys) > 0,
-            video_backend="pyav",
+            video_backend="torchcodec",
         )
 
         for ep_idx in tqdm(range(src_ds.num_episodes), desc=f"Resizing {repo_id}"):

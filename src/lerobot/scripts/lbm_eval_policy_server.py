@@ -58,9 +58,9 @@ from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.utils.constants import OBS_IMAGES, OBS_STATE
 from lerobot.utils.utils import get_safe_torch_device
 
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.INFO)
 
 
 def rot6d_to_rotation_matrix(rot6d: np.ndarray) -> np.ndarray:
@@ -697,7 +697,7 @@ class VLAPolicy(Policy):
             missing_keys = self.expected_image_keys - set(obs_image_keys)
             extra_keys = set(obs_image_keys) - self.expected_image_keys
             if missing_keys or extra_keys:
-                logger.warning(
+                logger.debug(
                     f"Image key mismatch - Missing: {sorted(missing_keys)}, Extra: {sorted(extra_keys)}"
                 )
             # remove image keys that are not in the expected image keys

@@ -3,9 +3,12 @@
 import argparse
 import logging
 import sys
+import os
 from pathlib import Path
 from tqdm import tqdm
 import torch
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from functools import partial
 
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
@@ -21,44 +24,51 @@ DEFAULT_LOG_FILE = "validate.out"
 # Validation Logic
 # ==============================================================================
 
-def validate_dataset(repo_id: str, dataset_root: Path, tolerance_s: float = 0.2) -> tuple[bool, str]:
+def validate_dataset(repo_id: str, dataset_root: str, tolerance_s: float = 0.2) -> tuple[bool, str]:
     """
     Validate a single dataset by attempting to load and iterate through all frames.
+    This function is designed to be called in parallel.
+    
+    Args:
+        repo_id: Dataset repository ID
+        dataset_root: Path to dataset root directory (as string for pickling)
+        tolerance_s: Tolerance for timestamp matching
     
     Returns:
-        (is_valid, error_message)
+        (repo_id, is_valid, error_message)
     """
     try:
-        dataset_path = dataset_root / repo_id
+        dataset_root_path = Path(dataset_root)
+        dataset_path = dataset_root_path / repo_id
         if not dataset_path.exists():
-            return False, f"Dataset directory does not exist: {dataset_path}"
+            return (repo_id, False, f"Dataset directory does not exist: {dataset_path}")
         
         if not (dataset_path / "meta" / "info.json").exists():
-            return False, f"Missing meta/info.json"
+            return (repo_id, False, f"Missing meta/info.json")
         
         # Try to load the dataset
-        dataset = LeRobotDataset(repo_id, root=dataset_root, tolerance_s=tolerance_s)
+        dataset = LeRobotDataset(repo_id, root=dataset_root_path, tolerance_s=tolerance_s)
         
         if dataset.num_frames == 0:
-            return False, "Dataset has 0 frames"
+            return (repo_id, False, "Dataset has 0 frames")
         
         # Try to access first frame to check basic structure
         try:
             sample = dataset[0]
             if not isinstance(sample, dict):
-                return False, f"Sample is not a dict, got {type(sample)}"
+                return (repo_id, False, f"Sample is not a dict, got {type(sample)}")
         except Exception as e:
-            return False, f"Failed to load first frame: {e}"
+            return (repo_id, False, f"Failed to load first frame: {e}")
         
         # Try to access last frame
         try:
             last_frame = dataset[dataset.num_frames - 1]
         except Exception as e:
-            return False, f"Failed to load last frame (idx {dataset.num_frames - 1}): {e}"
+            return (repo_id, False, f"Failed to load last frame (idx {dataset.num_frames - 1}): {e}")
         
-        # Try to iterate through all frames (with progress bar)
+        # Try to iterate through all frames (without tqdm for parallel execution)
         failed_indices = []
-        for idx in tqdm(range(dataset.num_frames), desc=f"Validating {repo_id}", leave=False):
+        for idx in range(dataset.num_frames):
             try:
                 frame = dataset[idx]
                 # Basic sanity check: frame should be a dict
@@ -72,12 +82,12 @@ def validate_dataset(repo_id: str, dataset_root: Path, tolerance_s: float = 0.2)
         
         if failed_indices:
             error_msg = f"Found {len(failed_indices)} invalid frames. First few: {failed_indices[:5]}"
-            return False, error_msg
+            return (repo_id, False, error_msg)
         
-        return True, "OK"
+        return (repo_id, True, "OK")
         
     except Exception as e:
-        return False, f"Exception during validation: {e}"
+        return (repo_id, False, f"Exception during validation: {e}")
 
 def main():
     parser = argparse.ArgumentParser(description="Validate datasets from a merge plan file")
@@ -89,6 +99,8 @@ def main():
                         help="Tolerance for timestamp matching")
     parser.add_argument("--log-file", type=str, default=DEFAULT_LOG_FILE,
                         help="Path to log file (default: validate.out)")
+    parser.add_argument("--max-workers", type=int, default=None,
+                        help="Maximum number of parallel workers (default: min(4, num_datasets))")
     args = parser.parse_args()
     
     # Setup logging to both console and file
@@ -136,16 +148,35 @@ def main():
     logging.info(f"Found {len(repo_ids)} datasets to validate")
     logging.info(f"Dataset root: {dataset_root}")
     
-    # Validate each dataset
+    # Determine number of workers (limit to prevent OOM)
+    if args.max_workers is None:
+        max_workers = min(4, len(repo_ids), (os.cpu_count() or 4) // 2)
+    else:
+        max_workers = args.max_workers
+    
+    logging.info(f"Using {max_workers} parallel workers for validation")
+    
+    # Validate each dataset in parallel
     results = []
-    for repo_id in tqdm(repo_ids, desc="Validating datasets"):
-        is_valid, message = validate_dataset(repo_id, dataset_root, tolerance_s=args.tolerance_s)
-        results.append((repo_id, is_valid, message))
+    validate_func = partial(validate_dataset, dataset_root=str(dataset_root), tolerance_s=args.tolerance_s)
+    
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        # Submit all tasks
+        future_to_repo = {executor.submit(validate_func, repo_id): repo_id for repo_id in repo_ids}
         
-        if is_valid:
-            logging.info(f"✓ {repo_id}: {message}")
-        else:
-            logging.error(f"✗ {repo_id}: {message}")
+        # Process completed tasks with progress bar
+        for future in tqdm(as_completed(future_to_repo), total=len(repo_ids), desc="Validating datasets"):
+            repo_id, is_valid, message = future.result()
+            results.append((repo_id, is_valid, message))
+            
+            if is_valid:
+                logging.info(f"✓ {repo_id}: {message}")
+            else:
+                logging.error(f"✗ {repo_id}: {message}")
+    
+    # Sort results by original order for consistent output
+    results_dict = {repo_id: (is_valid, message) for repo_id, is_valid, message in results}
+    results = [(repo_id, results_dict[repo_id][0], results_dict[repo_id][1]) for repo_id in repo_ids]
     
     # Summary
     valid_count = sum(1 for _, is_valid, _ in results if is_valid)
