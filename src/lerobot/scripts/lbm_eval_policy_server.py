@@ -94,7 +94,7 @@ def rot6d_to_rotation_matrix(rot6d: np.ndarray) -> np.ndarray:
     b3 = np.cross(b1, b2, axis=-1)
     
     # Stack to form rotation matrix
-    rotation_matrix = np.stack([b1, b2, b3], axis=-1)  # (N, 3, 3)
+    rotation_matrix = np.stack([b1, b2, b3], axis=-2)  # (N, 3, 3)
     
     if squeeze_output:
         rotation_matrix = rotation_matrix[0]
@@ -118,12 +118,8 @@ def rotation_matrix_to_rot6d(rot_matrix: np.ndarray) -> np.ndarray:
     else:
         squeeze_output = False
     
-    # Extract first two columns
-    col1 = rot_matrix[:, :, 0]  # (N, 3)
-    col2 = rot_matrix[:, :, 1]  # (N, 3)
-    
-    # Concatenate to form 6D representation
-    rot6d = np.concatenate([col1, col2], axis=-1)  # (N, 6)
+    batch_shape = rot_matrix.shape[:-2]
+    rot6d = rot_matrix[..., :2, :].copy().reshape(batch_shape + (6,))
     
     if squeeze_output:
         rot6d = rot6d[0]
