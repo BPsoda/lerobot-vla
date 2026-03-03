@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 import av
+import numpy as np
 import pyarrow as pa
 import torch
 import torchvision
@@ -242,6 +243,65 @@ def decode_video_frames_torchcodec(
     return closest_frames
 
 
+_NVENC_HW_ENCODERS = {
+    "libsvtav1": "av1_nvenc",
+    "h264": "h264_nvenc",
+    "hevc": "hevc_nvenc",
+}
+
+_nvenc_availability_cache: dict[str, bool] = {}
+
+
+def _is_hw_encoder_available(codec_name: str) -> bool:
+    """Check if a hardware encoder is actually usable by encoding a tiny test frame.
+
+    A simple codec lookup (``av.codec.Codec(name, "w")``) is not sufficient
+    because FFmpeg may register the encoder even when the GPU hardware does not
+    support it (e.g. av1_nvenc on Ampere GPUs).  Encoding a 64x64 frame is the
+    only reliable way to verify end-to-end support.
+    """
+    if codec_name in _nvenc_availability_cache:
+        return _nvenc_availability_cache[codec_name]
+
+    import io
+
+    available = False
+    try:
+        buf = io.BytesIO()
+        with av.open(buf, "w", format="mp4") as test_output:
+            stream = test_output.add_stream(codec_name, 30)
+            stream.width = 256
+            stream.height = 256
+            stream.pix_fmt = "yuv420p"
+            frame = av.VideoFrame(256, 256, "yuv420p")
+            for packet in stream.encode(frame):
+                test_output.mux(packet)
+            for packet in stream.encode():
+                test_output.mux(packet)
+        available = True
+    except Exception:
+        pass
+
+    _nvenc_availability_cache[codec_name] = available
+    if available:
+        logging.info(f"Hardware encoder '{codec_name}' is available and will be used.")
+    else:
+        logging.info(f"Hardware encoder '{codec_name}' is not supported on this GPU, using software fallback.")
+    return available
+
+
+def _resolve_encoder(vcodec: str) -> tuple[str, bool]:
+    """Return (encoder_name, is_hw_accelerated).
+
+    If a hardware-accelerated NVENC encoder exists for the requested codec
+    and is available on this system, prefer it over the software encoder.
+    """
+    hw_codec = _NVENC_HW_ENCODERS.get(vcodec)
+    if hw_codec is not None and _is_hw_encoder_available(hw_codec):
+        return hw_codec, True
+    return vcodec, False
+
+
 def encode_video_frames(
     imgs_dir: Path | str,
     video_path: Path | str,
@@ -264,8 +324,11 @@ def encode_video_frames(
 
     video_path.parent.mkdir(parents=True, exist_ok=overwrite)
 
-    # Encoders/pixel formats incompatibility check
-    if (vcodec == "libsvtav1" or vcodec == "hevc") and pix_fmt == "yuv444p":
+    # Try to use a hardware-accelerated encoder if available
+    actual_vcodec, is_hw = _resolve_encoder(vcodec)
+
+    # Encoders/pixel formats incompatibility check (applies to both SW and HW AV1/HEVC)
+    if vcodec in ("libsvtav1", "hevc") and pix_fmt == "yuv444p":
         logging.warning(
             f"Incompatible pixel format 'yuv444p' for codec {vcodec}, auto-selecting format 'yuv420p'"
         )
@@ -286,16 +349,25 @@ def encode_video_frames(
     # Define video codec options
     video_options = {}
 
-    if g is not None:
-        video_options["g"] = str(g)
-
-    if crf is not None:
-        video_options["crf"] = str(crf)
-
-    if fast_decode:
-        key = "svtav1-params" if vcodec == "libsvtav1" else "tune"
-        value = f"fast-decode={fast_decode}" if vcodec == "libsvtav1" else "fastdecode"
-        video_options[key] = value
+    if is_hw and actual_vcodec.endswith("_nvenc"):
+        # NVENC uses its own rate control; map crf → constqp + qp
+        if crf is not None:
+            video_options["rc"] = "constqp"
+            video_options["qp"] = str(crf)
+        if g is not None:
+            video_options["g"] = str(g)
+        # Disable B-frames so that small GOP sizes (e.g. g=2) are valid
+        video_options["bf"] = "0"
+        logging.info(f"Using hardware encoder '{actual_vcodec}' (NVENC) instead of '{vcodec}'")
+    else:
+        if g is not None:
+            video_options["g"] = str(g)
+        if crf is not None:
+            video_options["crf"] = str(crf)
+        if fast_decode:
+            key = "svtav1-params" if vcodec == "libsvtav1" else "tune"
+            value = f"fast-decode={fast_decode}" if vcodec == "libsvtav1" else "fastdecode"
+            video_options[key] = value
 
     # Set logging level
     if log_level is not None:
@@ -304,7 +376,7 @@ def encode_video_frames(
 
     # Create and open output file (overwrite by default)
     with av.open(str(video_path), "w") as output:
-        output_stream = output.add_stream(vcodec, fps, options=video_options)
+        output_stream = output.add_stream(actual_vcodec, fps, options=video_options)
         output_stream.pix_fmt = pix_fmt
         output_stream.width = width
         output_stream.height = height
@@ -323,6 +395,96 @@ def encode_video_frames(
             output.mux(packet)
 
     # Reset logging level
+    if log_level is not None:
+        av.logging.restore_default_callback()
+
+    if not video_path.exists():
+        raise OSError(f"Video encoding did not work. File not found: {video_path}.")
+
+
+def encode_video_frames_from_images(
+    images: list[np.ndarray | Image.Image],
+    video_path: Path | str,
+    fps: int,
+    vcodec: str = "libsvtav1",
+    pix_fmt: str = "yuv420p",
+    g: int | None = 2,
+    crf: int | None = 30,
+    fast_decode: int = 0,
+    log_level: int | None = av.logging.ERROR,
+    overwrite: bool = False,
+) -> None:
+    """Encode in-memory images directly to a video file, bypassing disk I/O.
+
+    Accepts numpy arrays (H, W, C uint8 RGB) or PIL Images.
+    Uses ``av.VideoFrame.from_ndarray`` for numpy inputs to avoid the
+    PIL round-trip overhead that ``encode_video_frames`` incurs when
+    reading PNGs from disk.
+    """
+    if vcodec not in ["h264", "hevc", "libsvtav1"]:
+        raise ValueError(f"Unsupported video codec: {vcodec}. Supported codecs are: h264, hevc, libsvtav1.")
+
+    if len(images) == 0:
+        raise ValueError("No images provided for video encoding.")
+
+    video_path = Path(video_path)
+    video_path.parent.mkdir(parents=True, exist_ok=overwrite)
+
+    actual_vcodec, is_hw = _resolve_encoder(vcodec)
+
+    if vcodec in ("libsvtav1", "hevc") and pix_fmt == "yuv444p":
+        logging.warning(
+            f"Incompatible pixel format 'yuv444p' for codec {vcodec}, auto-selecting format 'yuv420p'"
+        )
+        pix_fmt = "yuv420p"
+
+    first_img = images[0]
+    if isinstance(first_img, np.ndarray):
+        height, width = first_img.shape[:2]
+    else:
+        width, height = first_img.size
+
+    video_options: dict[str, str] = {}
+    if is_hw and actual_vcodec.endswith("_nvenc"):
+        if crf is not None:
+            video_options["rc"] = "constqp"
+            video_options["qp"] = str(crf)
+        if g is not None:
+            video_options["g"] = str(g)
+        video_options["bf"] = "0"
+        logging.info(f"Using hardware encoder '{actual_vcodec}' (NVENC) instead of '{vcodec}'")
+    else:
+        if g is not None:
+            video_options["g"] = str(g)
+        if crf is not None:
+            video_options["crf"] = str(crf)
+        if fast_decode:
+            key = "svtav1-params" if vcodec == "libsvtav1" else "tune"
+            value = f"fast-decode={fast_decode}" if vcodec == "libsvtav1" else "fastdecode"
+            video_options[key] = value
+
+    if log_level is not None:
+        logging.getLogger("libav").setLevel(log_level)
+
+    with av.open(str(video_path), "w") as output:
+        output_stream = output.add_stream(actual_vcodec, fps, options=video_options)
+        output_stream.pix_fmt = pix_fmt
+        output_stream.width = width
+        output_stream.height = height
+
+        for img in images:
+            if isinstance(img, np.ndarray):
+                frame = av.VideoFrame.from_ndarray(img, format="rgb24")
+            else:
+                frame = av.VideoFrame.from_image(img.convert("RGB"))
+            packet = output_stream.encode(frame)
+            if packet:
+                output.mux(packet)
+
+        packet = output_stream.encode()
+        if packet:
+            output.mux(packet)
+
     if log_level is not None:
         av.logging.restore_default_callback()
 

@@ -69,6 +69,7 @@ from lerobot.common.datasets.video_utils import (
     VideoFrame,
     decode_video_frames,
     encode_video_frames,
+    encode_video_frames_from_images,
     get_safe_default_codec,
     get_video_info,
 )
@@ -480,6 +481,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         # Unused attributes
         self.image_writer = None
         self.episode_buffer = None
+        self._episode_video_frames: dict[str, list[np.ndarray]] = {}
 
         self.root.mkdir(exist_ok=True, parents=True)
 
@@ -769,6 +771,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         ep_buffer["task"] = []
         for key in self.features:
             ep_buffer[key] = current_ep_idx if key == "episode_index" else []
+        self._episode_video_frames: dict[str, list[np.ndarray]] = {}
         return ep_buffer
 
     def _get_image_file_path(self, episode_index: int, image_key: str, frame_index: int) -> Path:
@@ -819,7 +822,15 @@ class LeRobotDataset(torch.utils.data.Dataset):
                     f"An element of the frame is not in the features. '{key}' not in '{self.features.keys()}'."
                 )
 
-            if self.features[key]["dtype"] in ["image", "video"]:
+            if self.features[key]["dtype"] == "video":
+                if key not in self._episode_video_frames:
+                    self._episode_video_frames[key] = []
+                img = frame[key]
+                if isinstance(img, torch.Tensor):
+                    img = img.cpu().numpy()
+                self._episode_video_frames[key].append(img)
+                self.episode_buffer[key].append(None)
+            elif self.features[key]["dtype"] == "image":
                 img_path = self._get_image_file_path(
                     episode_index=self.episode_buffer["episode_index"], image_key=key, frame_index=frame_index
                 )
@@ -873,10 +884,12 @@ class LeRobotDataset(torch.utils.data.Dataset):
 
         self._wait_image_writer()
         self._save_episode_table(episode_buffer, episode_index)
-        ep_stats = compute_episode_stats(episode_buffer, self.features)
+
+        video_frames = self._episode_video_frames if self._episode_video_frames else None
+        ep_stats = compute_episode_stats(episode_buffer, self.features, video_frames=video_frames)
 
         if len(self.meta.video_keys) > 0:
-            video_paths = self.encode_episode_videos(episode_index)
+            video_paths = self.encode_episode_videos(episode_index, video_frames=video_frames)
             for key in self.meta.video_keys:
                 episode_buffer[key] = video_paths[key]
 
@@ -964,23 +977,34 @@ class LeRobotDataset(torch.utils.data.Dataset):
         for ep_idx in range(self.meta.total_episodes):
             self.encode_episode_videos(ep_idx)
 
-    def encode_episode_videos(self, episode_index: int) -> dict:
+    def encode_episode_videos(
+        self,
+        episode_index: int,
+        video_frames: dict[str, list[np.ndarray]] | None = None,
+    ) -> dict:
         """
-        Use ffmpeg to convert frames stored as png into mp4 videos.
-        Note: `encode_video_frames` is a blocking call. Making it asynchronous shouldn't speedup encoding,
-        since video encoding with ffmpeg is already using multithreading.
+        Encode episode frames to mp4 videos.
+
+        When *video_frames* is provided, frames are encoded directly from memory
+        (skipping the PNG round-trip).  Otherwise the legacy path reads PNGs from
+        the images directory.
         """
         video_paths = {}
         for key in self.meta.video_keys:
             video_path = self.root / self.meta.get_video_file_path(episode_index, key)
             video_paths[key] = str(video_path)
             if video_path.is_file():
-                # Skip if video is already encoded. Could be the case when resuming data recording.
                 continue
-            img_dir = self._get_image_file_path(
-                episode_index=episode_index, image_key=key, frame_index=0
-            ).parent
-            encode_video_frames(img_dir, video_path, self.fps, overwrite=True)
+
+            if video_frames is not None and key in video_frames:
+                encode_video_frames_from_images(
+                    video_frames[key], video_path, self.fps, overwrite=True
+                )
+            else:
+                img_dir = self._get_image_file_path(
+                    episode_index=episode_index, image_key=key, frame_index=0
+                ).parent
+                encode_video_frames(img_dir, video_path, self.fps, overwrite=True)
 
         return video_paths
 

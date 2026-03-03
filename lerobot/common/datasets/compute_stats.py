@@ -72,6 +72,25 @@ def sample_images(image_paths: list[str]) -> np.ndarray:
     return images
 
 
+def sample_image_arrays(image_arrays: list[np.ndarray]) -> np.ndarray:
+    """Like ``sample_images`` but operates on in-memory numpy arrays (H, W, C)."""
+    sampled_indices = sample_indices(len(image_arrays))
+
+    images = None
+    for i, idx in enumerate(sampled_indices):
+        img = image_arrays[idx]
+        if img.ndim == 3 and img.shape[2] in (1, 3, 4):
+            img = img.transpose(2, 0, 1)  # H,W,C -> C,H,W
+        img = auto_downsample_height_width(img)
+
+        if images is None:
+            images = np.empty((len(sampled_indices), *img.shape), dtype=np.uint8)
+
+        images[i] = img
+
+    return images
+
+
 def get_feature_stats(array: np.ndarray, axis: tuple, keepdims: bool) -> dict[str, np.ndarray]:
     return {
         "min": np.min(array, axis=axis, keepdims=keepdims),
@@ -82,13 +101,20 @@ def get_feature_stats(array: np.ndarray, axis: tuple, keepdims: bool) -> dict[st
     }
 
 
-def compute_episode_stats(episode_data: dict[str, list[str] | np.ndarray], features: dict) -> dict:
+def compute_episode_stats(
+    episode_data: dict[str, list[str] | np.ndarray],
+    features: dict,
+    video_frames: dict[str, list[np.ndarray]] | None = None,
+) -> dict:
     ep_stats = {}
     for key, data in episode_data.items():
         if features[key]["dtype"] == "string":
             continue  # HACK: we should receive np.arrays of strings
         elif features[key]["dtype"] in ["image", "video"]:
-            ep_ft_array = sample_images(data)  # data is a list of image paths
+            if video_frames is not None and key in video_frames:
+                ep_ft_array = sample_image_arrays(video_frames[key])
+            else:
+                ep_ft_array = sample_images(data)  # data is a list of image paths
             axes_to_reduce = (0, 2, 3)  # keep channel dim
             keepdims = True
         else:
