@@ -282,8 +282,6 @@ class LBMDatasetConverter:
 
             dataset.save_episode()
 
-        dataset._close_writer()
-        dataset.meta._close_writer()
         return dataset
 
     def _load_episode_dirs_from_file(self) -> list[Path]:
@@ -313,6 +311,12 @@ class LBMDatasetConverter:
                 # Ensure the path ends with 'processed'
                 if episode_path.name != "processed":
                     episode_path = episode_path / "processed"
+
+                # Filter the episode path by the skill types
+                if self.skill_types is not None:
+                    skill_name = episode_path.parts[-9]
+                    if skill_name not in self.skill_types:
+                        continue
                 
                 # Verify the path exists
                 if episode_path.exists() and episode_path.is_dir():
